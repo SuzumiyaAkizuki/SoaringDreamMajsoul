@@ -33,9 +33,9 @@ def process_data(df_matches, df_namelist, mode="yonma"):
         namelist_lower = [str(x).lower().strip() for x in df_namelist.iloc[:, 0].dropna().tolist()]
 
     valid_matches = []
-    warnings = []
+    unregistered_players = set()  # 用集合来记录发现的未报名选手，自动去重
 
-    # 1. 过滤未报名的对局
+    # 1. 遍历所有对局（不再因为未报名选手而剔除整局）
     for idx, row in df_matches.iterrows():
         try:
             match_players = [str(row.iloc[c]).strip() for c in name_cols]
@@ -43,23 +43,16 @@ def process_data(df_matches, df_namelist, mode="yonma"):
         except (IndexError, ValueError):
             continue
 
-        unregistered = []
+        valid_matches.append((match_players, match_scores))
+
+        # 检查并记录未报名选手（仅用于 UI 提示）
         for p in match_players:
             p_lower = p.lower()
             is_valid = any(valid_name in p_lower for valid_name in namelist_lower)
             if not is_valid:
-                unregistered.append(p)
+                unregistered_players.add(p)
 
-        if unregistered:
-            warnings.append({
-                'row_idx': idx + 2,
-                'players': match_players,
-                'unregistered': set(unregistered)
-            })
-        else:
-            valid_matches.append((match_players, match_scores))
-
-    # 2. 生成选手成绩 Map
+    # 2. 生成选手成绩 Map (所有人都参与成绩统计)
     player_scores = {}
     for players, scores in valid_matches:
         for p, s in zip(players, scores):
@@ -67,9 +60,15 @@ def process_data(df_matches, df_namelist, mode="yonma"):
                 player_scores[p] = []
             player_scores[p].append(s)
 
-    # 3. 计算最终成绩
+    # 3. 计算最终成绩并过滤输出
     results = []
     for p, scores in player_scores.items():
+        # 【核心改动】：如果该选手不在白名单内，直接跳过，不输出到最终名单
+        p_lower = p.lower()
+        is_valid = any(valid_name in p_lower for valid_name in namelist_lower)
+        if not is_valid:
+            continue
+
         scores_reversed = scores[::-1]
         n = len(scores_reversed)
 
@@ -107,7 +106,7 @@ def process_data(df_matches, df_namelist, mode="yonma"):
         game_cols.sort(key=lambda x: int(x.replace("第", "").replace("场", "")))
         df_res = df_res[base_cols + game_cols]
 
-    return df_res, warnings
+    return df_res, list(unregistered_players)
 
 
 # --- UI 交互逻辑 ---
@@ -161,9 +160,9 @@ def calculate_and_refresh(mode, silent=False):
 
     if not silent:
         if df_res.empty or len(df_res.dropna(how='all')) == 0:
-            ui.notify(f"计算完成，但所有有效对局数为 0！", type='negative')
+            ui.notify(f"计算完成，但所有有效选手对局数为 0！", type='negative')
         else:
-            ui.notify(f"计算完成！共生成 {len(df_res)} 名选手的成绩。", type='positive')
+            ui.notify(f"计算完成！共生成 {len(df_res)} 名有效选手的成绩。", type='positive')
 
     result_ui.refresh(mode)
 
@@ -202,7 +201,7 @@ async def upload_sanma(e): await handle_upload(e, 'sanma')
 
 
 with ui.column().classes('w-full items-center p-4'):
-    ui.label('飞梦雀赛成绩统计器').classes('text-3xl font-bold mb-6 text-primary')
+    ui.label('🀄 雀魂赛事牌谱成绩计算工具').classes('text-3xl font-bold mb-6 text-primary')
 
     with ui.row().classes('w-full max-w-5xl gap-6 justify-center'):
         with ui.card().classes('w-72 items-center text-center'):
@@ -228,25 +227,20 @@ with ui.column().classes('w-full items-center p-4'):
         df = result_store.get(mode)
         warnings = warning_store.get(mode, [])
 
+        # 【核心改动】：重写警告面板，现在仅展示被隐藏的未报名玩家名单
         if warnings:
-            with ui.expansion(f"发现 {len(warnings)} 场包含未报名选手的对局（已自动剔除）", icon='warning').classes(
-                    'w-full bg-red-50 text-red-800 font-bold mb-4'):
-                with ui.column().classes('gap-2 p-2 w-full'):
-                    for w in warnings:
-                        with ui.row().classes('items-center gap-2 text-sm border-b pb-1 w-full'):
-                            ui.label(f"第 {w['row_idx']} 行:").classes('text-gray-500 w-16')
-                            for p in w['players']:
-                                if p in w['unregistered']:
-                                    ui.label(p).classes('text-red-600 font-bold bg-red-100 px-2 py-0.5 rounded')
-                                else:
-                                    ui.label(p).classes('text-gray-600')
+            with ui.expansion(f"⚠️ 发现 {len(warnings)} 名未报名选手（对局已正常计算，最终名单已隐藏其成绩）",
+                              icon='warning').classes('w-full bg-yellow-50 text-yellow-800 font-bold mb-4'):
+                with ui.row().classes('gap-2 p-3 w-full flex-wrap'):
+                    for p in warnings:
+                        ui.label(p).classes('text-yellow-800 font-bold bg-yellow-200 px-2 py-0.5 rounded')
         elif df is not None:
-            ui.label("所有对局均有效，无未报名选手参与。").classes('text-green-600 font-bold mb-4')
+            ui.label("✅ 所有参赛选手均已报名。").classes('text-green-600 font-bold mb-4')
 
         if df is not None:
             with ui.row().classes('w-full justify-between items-end mb-2'):
-                ui.label("提示: 表格仅展示总分，下载的 CSV 中包含各局明细").classes('text-gray-500 text-sm')
-                ui.button("下载成绩表 (.CSV)", on_click=lambda: download_result(mode)).classes(
+                ui.label("💡 提示: 表格仅展示总分，下载的 CSV 中包含各局明细").classes('text-gray-500 text-sm')
+                ui.button("⬇️ 下载成绩表 (.CSV)", on_click=lambda: download_result(mode)).classes(
                     'bg-blue-500 text-white')
 
             if not df.empty and "最终成绩" in df.columns and "用户名" in df.columns:
@@ -272,7 +266,6 @@ with ui.column().classes('w-full items-center p-4'):
             else:
                 display_df = pd.DataFrame(columns=["rank", "score", "username", "row_class"])
 
-            # --- 冲突已解除的配置项 ---
             aggrid_options = {
                 'columnDefs': [
                     {'headerName': '排名', 'field': 'rank', 'width': 80},
@@ -284,8 +277,8 @@ with ui.column().classes('w-full items-center p-4'):
                     'row-pass': 'data && data.row_class === "row-pass"',
                     'row-fail': 'data && data.row_class === "row-fail"'
                 },
-                'defaultColDef': {'minWidth': 120},  # 去掉了 'flex': 1
-                'overlayNoRowsTemplate': '<span class="text-gray-400">没有符合条件的有效对局数据</span>',
+                'defaultColDef': {'minWidth': 120},
+                'overlayNoRowsTemplate': '<span class="text-gray-400">没有符合条件的有效选手数据</span>',
             }
 
             ui.aggrid(aggrid_options).classes('h-[500px] w-full')
@@ -297,12 +290,12 @@ with ui.column().classes('w-full items-center p-4'):
 
     with ui.tab_panels(tabs, value=yonma_tab).classes('w-full max-w-5xl shadow-md rounded-lg border'):
         with ui.tab_panel('yonma'):
-            ui.button("手动计算四人成绩", on_click=lambda: calculate_and_refresh('yonma')).classes(
+            ui.button("▶️ 手动计算四人成绩", on_click=lambda: calculate_and_refresh('yonma')).classes(
                 'mb-4 w-full bg-blue-500 text-white font-bold')
             result_ui('yonma')
 
         with ui.tab_panel('sanma'):
-            ui.button("手动计算三人成绩", on_click=lambda: calculate_and_refresh('sanma')).classes(
+            ui.button("▶️ 手动计算三人成绩", on_click=lambda: calculate_and_refresh('sanma')).classes(
                 'mb-4 w-full bg-purple-500 text-white font-bold')
             result_ui('sanma')
 
